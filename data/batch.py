@@ -1,13 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Tuple
-
-import torch
-
-
 """
-功能概述：
+功能：
 1. 构造 Transformer 训练阶段所需的 src_mask。
 2. 构造同时包含 padding mask + causal mask 的 tgt_mask。
 3. 将完整 target 序列切分为：
@@ -20,10 +14,15 @@ import torch
 2. 这里的 shifted right 采用最稳妥的切片写法：
    tgt_input = tgt[:, :-1]
    tgt_y     = tgt[:, 1:]
-3. 当前实现与用户现有的 MultiHeadedAttention 兼容：
+3. 当前实现与你前面的 MultiHeadedAttention 兼容：
    - src_mask 形状: (B, 1, S)
    - tgt_mask 形状: (B, T, T)
 """
+
+from dataclasses import dataclass
+from typing import Tuple
+
+import torch
 
 
 def subsequent_mask(size: int, device: torch.device) -> torch.Tensor:
@@ -71,19 +70,13 @@ def shift_right(tgt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                    送入 Decoder 的输入
         tgt_y:     形状 (B, T_full - 1)
                    训练监督标签
-
-    示例：
-        tgt = [BOS, w1, w2, EOS, PAD]
-        tgt_input = [BOS, w1, w2, EOS]
-        tgt_y     = [w1,  w2, EOS, PAD]
     """
     if tgt.dim() != 2:
         raise ValueError(f"tgt 必须是 2 维张量，当前维度为: {tgt.dim()}")
 
     if tgt.size(1) < 2:
         raise ValueError(
-            "tgt 的序列长度至少要 >= 2，"
-            "因为必须能够切分出 tgt_input 和 tgt_y。"
+            "tgt 的序列长度至少要 >= 2，因为必须能够切分出 tgt_input 和 tgt_y。"
         )
 
     tgt_input = tgt[:, :-1].contiguous()
@@ -103,10 +96,8 @@ def make_tgt_mask(tgt_input: torch.Tensor, pad_idx: int) -> torch.Tensor:
         tgt_mask: 形状 (B, T, T) 的 bool Tensor
 
     构造逻辑：
-        1. padding mask: 屏蔽掉 PAD 位置
-           形状先为 (B, 1, T)
-        2. causal mask: 只允许看当前位置及之前位置
-           形状为 (1, T, T)
+        1. padding mask: 屏蔽掉 PAD 位置，形状 (B, 1, T)
+        2. causal mask:  只允许看当前位置及之前位置，形状 (1, T, T)
         3. 两者按位与，广播后得到 (B, T, T)
     """
     if tgt_input.dim() != 2:
@@ -114,11 +105,36 @@ def make_tgt_mask(tgt_input: torch.Tensor, pad_idx: int) -> torch.Tensor:
             f"tgt_input 必须是 2 维张量，当前维度为: {tgt_input.dim()}"
         )
 
-    pad_mask = (tgt_input != pad_idx).unsqueeze(1)          # (B, 1, T)
+    pad_mask = (tgt_input != pad_idx).unsqueeze(1)  # (B, 1, T)
     causal_mask = subsequent_mask(tgt_input.size(1), tgt_input.device)  # (1, T, T)
 
-    tgt_mask = pad_mask & causal_mask                       # -> (B, T, T)
+    tgt_mask = pad_mask & causal_mask
     return tgt_mask
+
+
+def pad_sequences(sequences, pad_idx: int) -> torch.Tensor:
+    """
+    将变长 id 序列 padding 成统一长度的 LongTensor。
+
+    输入：
+        sequences: List[List[int]]
+        pad_idx: PAD 的词表 id
+
+    输出：
+        tensor: 形状 (B, L_max)
+    """
+    if len(sequences) == 0:
+        raise ValueError("sequences 不能为空。")
+
+    max_len = max(len(seq) for seq in sequences)
+    batch_size = len(sequences)
+
+    out = torch.full((batch_size, max_len), pad_idx, dtype=torch.long)
+
+    for i, seq in enumerate(sequences):
+        out[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+
+    return out
 
 
 @dataclass
