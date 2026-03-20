@@ -4,3 +4,5 @@ transformer_project_code.txt
 raw.de
 raw.en
 /data/wmt14*/
+tools/mosesdecoder
+experiments

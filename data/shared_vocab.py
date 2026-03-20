@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 
 @dataclass
@@ -84,7 +84,7 @@ class SharedVocab:
         cls,
         file_paths: Sequence[str],
         min_freq: int = 1,
-        special_tokens: SpecialTokens | None = None,
+        special_tokens: Optional[SpecialTokens] = None,
     ) -> "SharedVocab":
         """
         从多个训练文本文件中构建共享词表。
@@ -117,7 +117,6 @@ class SharedVocab:
         # 排序策略：
         # 1. 先按词频降序
         # 2. 词频相同按字典序
-        # 这样可以保证构建结果稳定、可复现
         normal_tokens = [
             (tok, freq)
             for tok, freq in counter.items()
@@ -160,7 +159,7 @@ class SharedVocab:
     def load(
         cls,
         vocab_json_path: str,
-        special_tokens: SpecialTokens | None = None,
+        special_tokens: Optional[SpecialTokens] = None,
     ) -> "SharedVocab":
         """
         从 vocab.json 加载词表。
