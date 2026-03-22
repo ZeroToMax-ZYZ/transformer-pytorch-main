@@ -5,7 +5,11 @@ import math
 
 class PositionalEncoding(nn.Module):
     """
-    注入绝对位置信息的正弦波编码器。
+    固定的正弦/余弦位置编码。
+
+    与论文一致：
+    1. 不引入可学习参数。
+    2. 对输入 `(B, T, d_model)` 直接按位置相加。
     """
     def __init__(self, d_model, dropout, max_len=5000):
         super(PositionalEncoding, self).__init__()
@@ -32,6 +36,6 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)
 
     def forward(self, x):
-        # 运行时直接截取序列长度并相加，无需操作 autograd 图
+        # `pe` 是 buffer，不参与梯度更新。
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)

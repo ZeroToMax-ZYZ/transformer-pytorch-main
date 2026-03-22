@@ -1,3 +1,12 @@
+"""
+Transformer 的核心 Encoder-Decoder 结构。
+
+和论文的关系：
+1. 编码器、解码器、多头注意力、FFN、残差连接都沿用原始 Transformer 结构。
+2. `SublayerConnection` 采用的是 Pre-LN：`x + sublayer(norm(x))`。
+   原论文图中对应的是 Post-LN：`norm(x + sublayer(x))`。
+"""
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -13,29 +22,19 @@ import copy
 
 def clones(module, N):
     """
-    层克隆工具函数。
-    
-    物理意义：在内存中创建 N 个结构完全相同，但权重互相独立（参数不共享）的神经网络层。
-    
-    工程边界条件（极易踩坑点）：
-    1. 必须使用 copy.deepcopy()：如果使用 [module] * N 或浅拷贝，Python 只会复制内存指针。
-       这会导致 N 个层实际上指向同一组物理权重（变成了类似 ALBERT 模型的参数共享机制），
-       违背了标准 Transformer 每层独立学习特征的设计初衷。
-    2. 必须包装在 nn.ModuleList 中：如果只返回一个普通的 Python 列表（List），
-       PyTorch 的底层机制将无法追踪这些层，模型在调用 model.parameters() 时会漏掉这些权重，
-       导致这 N 个层在反向传播时完全不更新（无法计算梯度）。
+    克隆 N 个结构相同但参数独立的子模块。
     """
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
 
 class SublayerConnection(nn.Module):
     """
-    子层连接包装器 (Sublayer Connection Wrapper)。
-    
-    物理意义：
-    它是一个通用的“插槽”。无论是多头注意力 (Multi-Head Attention) 还是
-    前馈神经网络 (Feed Forward)，都可以塞进这个包装器里。
-    它负责为其内部的子模块自动添加：LayerNorm、Dropout 以及 残差连接 (Residual Connection)。
+    子层连接包装器。
+
+    当前实现使用 Pre-LN：
+        x + dropout(sublayer(norm(x)))
+
+    这和论文图中的 Post-LN 不同，但通常更容易训练深层模型。
     """
 
     def __init__(self, size, dropout):
@@ -53,17 +52,7 @@ class SublayerConnection(nn.Module):
 
     def forward(self, x, sublayer):
         """
-        前向传播。
-        
-        参数:
-        x (Tensor): 输入张量，维度 (batch_size, seq_len, d_model)
-        sublayer (Callable): 一个可调用的神经网络模块 (如 Attention 或 FFN 函数)
-        
-        数据流与运算顺序 (严格遵循 Pre-LN 范式):
-        1. self.norm(x): 先对输入进行层归一化
-        2. sublayer(...): 将归一化后的数据送入子层 (提取特征)
-        3. self.dropout(...): 对提取出的特征进行正则化
-        4. x + ... : 将原始输入 x 与上述结果相加 (残差连接)
+        对任意子层应用 `LayerNorm -> Sublayer -> Dropout -> Residual`。
         """
         return x + self.dropout(sublayer(self.norm(x)))
 
@@ -314,9 +303,7 @@ class DecoderLayer(nn.Module):
 
 class EncoderDecoder(nn.Module):
     """
-    标准的编码器-解码器顶层架构包装器。
-    设计意图：将模型解耦为 5 个正交的独立组件（编码、解码、源嵌入、目标嵌入、生成头），
-    通过构造函数注入（Dependency Injection），保证底层模块的极高可复用性。
+    标准的编码器-解码器顶层包装器。
     """
 
     def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
@@ -340,18 +327,17 @@ class EncoderDecoder(nn.Module):
 
     def forward(self, src, tgt, src_mask, tgt_mask):
         """
-        前向传播函数。注意：此函数仅在【训练阶段（Training）】使用。
-        在训练时，我们拥有完整的目标序列 tgt（Teacher Forcing 机制），因此可以一次性并行计算。
-        
-        输入维度假定：
-        src: (batch_size, src_seq_len)
-        tgt: (batch_size, tgt_seq_len)
-        src_mask: (batch_size, 1, src_seq_len) - 用于屏蔽 Padding
-        tgt_mask: (batch_size, tgt_seq_len, tgt_seq_len) - 用于实现下三角掩码，防止信息穿越
+        训练阶段前向传播。
+
+        输入：
+        - src:      (B, S)
+        - tgt:      (B, T)
+        - src_mask: (B, 1, S)
+        - tgt_mask: (B, T, T)
+
+        返回 Decoder 隐状态 `(B, T, d_model)`。
+        词表 logits 由外部 `model.generator(...)` 生成。
         """
-        # 数据流：
-        # 1. 走 self.encode() 拿到源序列的全局上下文特征 memory
-        # 2. 将 memory、tgt 以及对应的 mask 一起送入 self.decode() 获取最终隐状态
         memory = self.encode(src, src_mask)
         out = self.decode(memory, src_mask, tgt, tgt_mask)
         return out
@@ -376,7 +362,7 @@ class EncoderDecoder(nn.Module):
 
 class Embeddings(nn.Module):
     """
-    标准的词嵌入层 + 位置编码胶水层
+    token embedding + sinusoidal positional encoding。
     """
     def __init__(self, d_model, vocab_size, dropout=0.1):
         super(Embeddings, self).__init__()
@@ -385,8 +371,7 @@ class Embeddings(nn.Module):
         self.pe = PositionalEncoding(d_model, dropout)
 
     def forward(self, x):
-        # 数学细节：论文指出，在将 Embedding 加上 PE 之前，
-        # 需要将 Embedding 乘以 sqrt(d_model) 进行缩放，以此来平衡方差。
+        # 与论文一致：embedding 在叠加位置编码前先乘上 sqrt(d_model)。
         x = self.lut(x) * math.sqrt(self.d_model)
         return self.pe(x)
 

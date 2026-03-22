@@ -8,12 +8,10 @@ import copy
 
 class PositionwiseFeedForward(nn.Module):
     """
-    逐位置前馈神经网络 (Position-wise FFN)。
-    
-    架构定位：
-    如果说 Attention 负责在全局视角下“寻找关联” (跨 Token 的信息混合)，
-    那么 FFN 就负责在局部视角下“升华特征” (单个 Token 内部的非线性映射)。
-    两者是完全正交的设计。
+    逐位置前馈网络。
+
+    结构与论文一致：
+        Linear(d_model -> d_ff) -> ReLU -> Dropout -> Linear(d_ff -> d_model)
     """
 
     def __init__(self, d_model, d_ff, dropout=0.1):
@@ -41,19 +39,8 @@ class PositionwiseFeedForward(nn.Module):
 
     def forward(self, x):
         """
-        前向传播计算。
-        
-        张量流转：
-        输入 x: (batch_size, seq_len, d_model)
-        执行逻辑：x -> Linear(d_model->d_ff) -> ReLU -> Dropout -> Linear(d_ff->d_model)
-        
-        工程细节 (关于 Position-wise 的底层实现)：
-        PyTorch 的 nn.Linear 默认只作用于张量的最后一个维度。
-        因此，当传入 3D 张量 (batch_size, seq_len, d_model) 时，
-        矩阵乘法是独立且等价地作用于 seq_len 中的每一个 Token 上的。
-        相当于一个 kernel_size=1 的 1D 卷积。
+        输入 `x` 形状为 `(B, T, d_model)`，输出形状不变。
         """
-        # 注意：在较新的 PyTorch 规范中，推荐直接使用 F.relu 而不是对张量调用 .relu()
         return self.w_2(self.dropout(F.relu(self.w_1(x))))
 
 

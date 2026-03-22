@@ -13,8 +13,8 @@ from __future__ import annotations
 
 说明：
 1. 第一版验证以 loss / ppl / token_acc 为主。
-2. 文本样例默认使用 greedy decode。
-3. 这里不引入 beam search，后面再单独加。
+2. 文本样例默认使用 greedy decode，只用于快速观察输出，不代表最终 BLEU 评估配置。
+3. 这里不引入 beam search；真正的 beam search 和 checkpoint averaging 在 `evaluate_transformer_bleu.py` 中单独实现。
 """
 
 from typing import Dict, List, Optional

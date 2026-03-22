@@ -14,16 +14,17 @@ from __future__ import annotations
 2. 启动 Transformer WMT14 英德训练。
 
 说明：
-1. 当前版本采用固定 batch_size + 流式 buffer shuffle。
-2. 这是“第一版正式训练入口”。
-3. 若后续要更贴论文 batching，可再升级成近似长度分桶 + token budget。
+1. 当前默认训练批处理采用近似长度分桶 + token budget。
+2. 验证集仍保持普通 batch_size，便于稳定对比 loss / ppl。
+3. 训练集可按比例截取一个前缀子集，方便调试训练链路。
 """
 
+import argparse
 import os
 import torch
 
 from data.shared_vocab import SharedVocab
-from data.wmt_14_bpe_dataset import build_bpe_dataloader
+from data.wmt_14_bpe_dataset import build_bpe_dataloader, resolve_num_samples_for_ratio
 from nets.build_transformer import make_model
 from train_utils.fit import fit
 from utils.label_smoothing import LabelSmoothingLoss
@@ -31,11 +32,36 @@ from utils.noam_scheduler import build_transformer_optimizer_and_scheduler
 from utils.train_env import count_trainable_parameters, get_device, get_timestamp_str, seed_everything
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train the Transformer base model on WMT14 En-De BPE data.")
+    parser.add_argument("--num-epochs", type=int, default=None, help="Override the number of training epochs.")
+    parser.add_argument("--train-batch-size", type=int, default=None, help="Override the training batch size.")
+    parser.add_argument("--valid-batch-size", type=int, default=None, help="Override the validation batch size.")
+    parser.add_argument("--train-src-token-budget", type=int, default=None, help="Override train source token budget.")
+    parser.add_argument("--train-tgt-token-budget", type=int, default=None, help="Override train target token budget.")
+    parser.add_argument("--train-batch-pool-size", type=int, default=None, help="Override train approximate-length pooling size.")
+    parser.add_argument(
+        "--train-subset-ratio",
+        type=float,
+        default=0.001,
+        help="Use only a prefix subset of the training split, e.g. 0.2 means 20%% of train samples.",
+    )
+    parser.add_argument("--train-num-workers", type=int, default=None, help="Override train DataLoader workers.")
+    parser.add_argument("--valid-num-workers", type=int, default=None, help="Override valid DataLoader workers.")
+    parser.add_argument("--max-train-steps-per-epoch", type=int, default=None, help="Limit train steps per epoch.")
+    parser.add_argument("--max-valid-steps-per-epoch", type=int, default=None, help="Limit valid steps per epoch.")
+    parser.add_argument("--max-src-len", type=int, default=None, help="Truncate source length for debugging.")
+    parser.add_argument("--max-tgt-len", type=int, default=None, help="Truncate target length for debugging.")
+    parser.add_argument("--output-dir", type=str, default=None, help="Override the experiment output directory.")
+    return parser.parse_args()
+
+
 def build_config(device: torch.device, vocab_size: int) -> dict:
     """
     构建实验配置。
     """
     use_amp = device.type == "cuda"
+    default_train_num_workers = 0 if os.name == "nt" else 2
 
     config = {
         "exp_name": "transformer_wmt14_en_de_base",
@@ -49,6 +75,7 @@ def build_config(device: torch.device, vocab_size: int) -> dict:
             "valid_src": "data/wmt14_bpe_en_de/valid.en",
             "valid_tgt": "data/wmt14_bpe_en_de/valid.de",
             "train_num_samples": 3927488,
+            "train_subset_ratio": 1.0,
             "valid_num_samples": 3000,
         },
 
@@ -90,8 +117,8 @@ def build_config(device: torch.device, vocab_size: int) -> dict:
         },
 
         "train_loader": {
-            "batch_size": 16,
-            "num_workers": 2,
+            "batch_size": None,
+            "num_workers": default_train_num_workers,
             "pin_memory": device.type == "cuda",
             "max_src_len": None,
             "max_tgt_len": None,
@@ -101,10 +128,14 @@ def build_config(device: torch.device, vocab_size: int) -> dict:
             "seed": 42,
             "persistent_workers": True,
             "prefetch_factor": 2,
+            "src_token_budget": 1024,
+            "tgt_token_budget": 1024,
+            "max_sentences_per_batch": None,
+            "batch_pool_size": 2048,
         },
 
         "valid_loader": {
-            "batch_size": 16,
+            "batch_size": 64,
             "num_workers": 0,
             "pin_memory": device.type == "cuda",
             "max_src_len": None,
@@ -118,20 +149,94 @@ def build_config(device: torch.device, vocab_size: int) -> dict:
         },
 
         "fit": {
-            "num_epochs": 30,
+            "num_epochs": 100,
             "grad_clip_norm": 1.0,
             "train_log_interval": 100,
-            "histogram_interval": 1000,
+            "histogram_interval": 0,
             "save_every_epochs": 1,
-            "valid_num_text_samples": 3,
-            "max_train_steps_per_epoch": None,
+            "valid_num_text_samples": 0,
+            "max_train_steps_per_epoch": 1000,
             "max_valid_steps_per_epoch": None,
         },
     }
     return config
 
 
+def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
+    if args.num_epochs is not None:
+        config["fit"]["num_epochs"] = args.num_epochs
+    if args.train_batch_size is not None:
+        config["train_loader"]["batch_size"] = args.train_batch_size
+    if args.valid_batch_size is not None:
+        config["valid_loader"]["batch_size"] = args.valid_batch_size
+    if args.train_src_token_budget is not None:
+        config["train_loader"]["src_token_budget"] = args.train_src_token_budget
+    if args.train_tgt_token_budget is not None:
+        config["train_loader"]["tgt_token_budget"] = args.train_tgt_token_budget
+    if args.train_batch_pool_size is not None:
+        config["train_loader"]["batch_pool_size"] = args.train_batch_pool_size
+    if args.train_subset_ratio is not None:
+        config["data"]["train_subset_ratio"] = args.train_subset_ratio
+    if args.train_num_workers is not None:
+        config["train_loader"]["num_workers"] = args.train_num_workers
+        config["train_loader"]["persistent_workers"] = args.train_num_workers > 0
+    if args.valid_num_workers is not None:
+        config["valid_loader"]["num_workers"] = args.valid_num_workers
+        config["valid_loader"]["persistent_workers"] = args.valid_num_workers > 0
+    if args.max_train_steps_per_epoch is not None:
+        config["fit"]["max_train_steps_per_epoch"] = args.max_train_steps_per_epoch
+    if args.max_valid_steps_per_epoch is not None:
+        config["fit"]["max_valid_steps_per_epoch"] = args.max_valid_steps_per_epoch
+    if args.max_src_len is not None:
+        config["train_loader"]["max_src_len"] = args.max_src_len
+        config["valid_loader"]["max_src_len"] = args.max_src_len
+    if args.max_tgt_len is not None:
+        config["train_loader"]["max_tgt_len"] = args.max_tgt_len
+        config["valid_loader"]["max_tgt_len"] = args.max_tgt_len
+    return config
+
+
+def build_train_loader_kwargs(config: dict, vocab: SharedVocab) -> dict:
+    """
+    构造训练 DataLoader 参数。
+
+    这里显式把训练集子集比例换算成样本数，保证：
+    1. DataLoader 的 `len` 与实际迭代长度一致。
+    2. checkpoint 里的配置能完整描述这次训练到底看了多少样本。
+    """
+    total_train_samples = config["data"]["train_num_samples"]
+    train_subset_ratio = config["data"]["train_subset_ratio"]
+    train_subset_num_samples = resolve_num_samples_for_ratio(
+        total_num_samples=total_train_samples,
+        subset_ratio=train_subset_ratio,
+    )
+
+    return {
+        "src_path": config["data"]["train_src"],
+        "tgt_path": config["data"]["train_tgt"],
+        "vocab": vocab,
+        "batch_size": config["train_loader"]["batch_size"],
+        "num_workers": config["train_loader"]["num_workers"],
+        "pin_memory": config["train_loader"]["pin_memory"],
+        "max_src_len": config["train_loader"]["max_src_len"],
+        "max_tgt_len": config["train_loader"]["max_tgt_len"],
+        "add_src_eos": config["train_loader"]["add_src_eos"],
+        "skip_empty": config["train_loader"]["skip_empty"],
+        "shuffle_buffer_size": config["train_loader"]["shuffle_buffer_size"],
+        "seed": config["train_loader"]["seed"],
+        "num_samples": train_subset_num_samples,
+        "sample_limit": train_subset_num_samples,
+        "persistent_workers": config["train_loader"]["persistent_workers"],
+        "prefetch_factor": config["train_loader"]["prefetch_factor"],
+        "src_token_budget": config["train_loader"]["src_token_budget"],
+        "tgt_token_budget": config["train_loader"]["tgt_token_budget"],
+        "max_sentences_per_batch": config["train_loader"]["max_sentences_per_batch"],
+        "batch_pool_size": config["train_loader"]["batch_pool_size"],
+    }
+
+
 def main() -> None:
+    args = parse_args()
     device = get_device()
     seed_everything(seed=42, deterministic=False)
 
@@ -139,24 +244,10 @@ def main() -> None:
     vocab_size = len(vocab)
 
     config = build_config(device=device, vocab_size=vocab_size)
+    config = apply_cli_overrides(config=config, args=args)
 
-    train_loader = build_bpe_dataloader(
-        src_path=config["data"]["train_src"],
-        tgt_path=config["data"]["train_tgt"],
-        vocab=vocab,
-        batch_size=config["train_loader"]["batch_size"],
-        num_workers=config["train_loader"]["num_workers"],
-        pin_memory=config["train_loader"]["pin_memory"],
-        max_src_len=config["train_loader"]["max_src_len"],
-        max_tgt_len=config["train_loader"]["max_tgt_len"],
-        add_src_eos=config["train_loader"]["add_src_eos"],
-        skip_empty=config["train_loader"]["skip_empty"],
-        shuffle_buffer_size=config["train_loader"]["shuffle_buffer_size"],
-        seed=config["train_loader"]["seed"],
-        num_samples=config["data"]["train_num_samples"],
-        persistent_workers=config["train_loader"]["persistent_workers"],
-        prefetch_factor=config["train_loader"]["prefetch_factor"],
-    )
+    train_loader_kwargs = build_train_loader_kwargs(config=config, vocab=vocab)
+    train_loader = build_bpe_dataloader(**train_loader_kwargs)
 
     valid_loader = build_bpe_dataloader(
         src_path=config["data"]["valid_src"],
@@ -174,6 +265,10 @@ def main() -> None:
         num_samples=config["data"]["valid_num_samples"],
         persistent_workers=config["valid_loader"]["persistent_workers"],
         prefetch_factor=config["valid_loader"]["prefetch_factor"],
+        src_token_budget=config["valid_loader"].get("src_token_budget"),
+        tgt_token_budget=config["valid_loader"].get("tgt_token_budget"),
+        max_sentences_per_batch=config["valid_loader"].get("max_sentences_per_batch"),
+        batch_pool_size=config["valid_loader"].get("batch_pool_size", 2048),
     )
 
     model = make_model(
@@ -189,6 +284,11 @@ def main() -> None:
 
     param_count = count_trainable_parameters(model)
     print(f"模型可训练参数量: {param_count / 1e6:.2f} M")
+    print(
+        "训练集样本数: "
+        f"{train_loader_kwargs['num_samples']} / {config['data']['train_num_samples']} "
+        f"(ratio={config['data']['train_subset_ratio']:.4f})"
+    )
 
     criterion = LabelSmoothingLoss(
         vocab_size=vocab_size,
@@ -210,10 +310,12 @@ def main() -> None:
     use_amp = config["use_amp"]
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-    exp_dir = os.path.join(
-        "experiments",
-        "{0}_{1}".format(config["exp_name"], get_timestamp_str()),
-    )
+    exp_dir = args.output_dir
+    if exp_dir is None:
+        exp_dir = os.path.join(
+            "experiments",
+            "{0}_{1}".format(config["exp_name"], get_timestamp_str()),
+        )
 
     fit(
         model=model,
@@ -244,3 +346,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+ 

@@ -20,9 +20,9 @@ import os
 import torch
 
 from data.shared_vocab import SharedVocab
-from data.wmt14_bpe_dataset import build_bpe_dataloader
+from data.wmt_14_bpe_dataset import build_bpe_dataloader, resolve_num_samples_for_ratio
 from nets.build_transformer import make_model
-from train.fit import fit
+from train_utils.fit import fit
 from utils.label_smoothing import LabelSmoothingLoss
 from utils.noam_scheduler import build_transformer_optimizer_and_scheduler
 from utils.resume_utils import load_checkpoint_for_resume
@@ -37,9 +37,26 @@ def main() -> None:
 
     checkpoint = torch.load(resume_path, map_location="cpu")
     config = checkpoint["config"]
+    config.setdefault("data", {})
+    config["data"].setdefault("train_subset_ratio", 1.0)
+    fit_config = config.setdefault("fit", {})
+    config["fit"] = {
+        "num_epochs": fit_config.get("num_epochs", 100),
+        "grad_clip_norm": fit_config.get("grad_clip_norm", 1.0),
+        "train_log_interval": fit_config.get("train_log_interval", 100),
+        "histogram_interval": fit_config.get("histogram_interval", 0),
+        "save_every_epochs": fit_config.get("save_every_epochs", 1),
+        "valid_num_text_samples": fit_config.get("valid_num_text_samples", 0),
+        "max_train_steps_per_epoch": fit_config.get("max_train_steps_per_epoch"),
+        "max_valid_steps_per_epoch": fit_config.get("max_valid_steps_per_epoch"),
+    }
 
     vocab = SharedVocab.load(config["vocab"]["vocab_json"])
     vocab_size = len(vocab)
+    train_subset_num_samples = resolve_num_samples_for_ratio(
+        total_num_samples=config["data"]["train_num_samples"],
+        subset_ratio=config["data"]["train_subset_ratio"],
+    )
 
     train_loader = build_bpe_dataloader(
         src_path=config["data"]["train_src"],
@@ -54,9 +71,14 @@ def main() -> None:
         skip_empty=config["train_loader"]["skip_empty"],
         shuffle_buffer_size=config["train_loader"]["shuffle_buffer_size"],
         seed=config["train_loader"]["seed"],
-        num_samples=config["data"]["train_num_samples"],
+        num_samples=train_subset_num_samples,
+        sample_limit=train_subset_num_samples,
         persistent_workers=config["train_loader"]["persistent_workers"],
         prefetch_factor=config["train_loader"]["prefetch_factor"],
+        src_token_budget=config["train_loader"].get("src_token_budget"),
+        tgt_token_budget=config["train_loader"].get("tgt_token_budget"),
+        max_sentences_per_batch=config["train_loader"].get("max_sentences_per_batch"),
+        batch_pool_size=config["train_loader"].get("batch_pool_size", 2048),
     )
 
     valid_loader = build_bpe_dataloader(
@@ -75,6 +97,10 @@ def main() -> None:
         num_samples=config["data"]["valid_num_samples"],
         persistent_workers=config["valid_loader"]["persistent_workers"],
         prefetch_factor=config["valid_loader"]["prefetch_factor"],
+        src_token_budget=config["valid_loader"].get("src_token_budget"),
+        tgt_token_budget=config["valid_loader"].get("tgt_token_budget"),
+        max_sentences_per_batch=config["valid_loader"].get("max_sentences_per_batch"),
+        batch_pool_size=config["valid_loader"].get("batch_pool_size", 2048),
     )
 
     model = make_model(
@@ -90,6 +116,11 @@ def main() -> None:
 
     param_count = count_trainable_parameters(model)
     print(f"模型可训练参数量: {param_count / 1e6:.2f} M")
+    print(
+        "训练集样本数: "
+        f"{train_subset_num_samples} / {config['data']['train_num_samples']} "
+        f"(ratio={config['data']['train_subset_ratio']:.4f})"
+    )
 
     criterion = LabelSmoothingLoss(
         vocab_size=vocab_size,

@@ -29,6 +29,7 @@ def tie_transformer_weights(model: EncoderDecoder) -> None:
     说明：
         这要求 src/tgt 使用同一个 joint vocabulary，
         也就是同一套 token id 体系。
+        在当前项目中，这和论文里共享 BPE 词表、共享 embedding / generator 权重的做法一致。
     """
     shared_weight = model.tgt_embed.lut.weight
 
@@ -64,6 +65,10 @@ def make_model(
 
     返回：
         完整的 EncoderDecoder 模型
+
+    备注：
+        底层 `EncoderLayer` / `DecoderLayer` 使用的是 Pre-LN 变体，
+        因此这里得到的是“结构与论文接近、归一化位置略有不同”的实现。
     """
     c = copy.deepcopy
 

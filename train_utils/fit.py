@@ -80,6 +80,11 @@ def fit(
 ) -> None:
     """
     顶层训练入口。
+
+    负责串起整轮实验管理：
+    1. 保存配置、曲线和 checkpoint。
+    2. 调用 `train_one_epoch` 与 `validate_one_epoch`。
+    3. 维护 resume 所需的 epoch / global_step / best metric。
     """
     os.makedirs(output_dir, exist_ok=True)
 
