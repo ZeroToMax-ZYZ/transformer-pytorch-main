@@ -22,6 +22,7 @@ from typing import Dict, List, Optional
 import torch
 
 from data.batch import make_tgt_mask
+from utils.distributed import unwrap_model
 from utils.label_smoothing import (
     LabelSmoothingLoss,
     compute_perplexity_from_loss,
@@ -76,7 +77,8 @@ def greedy_decode(
     输出：
         ys: (B, T_pred)，包含 BOS 开头，后续逐步生成
     """
-    memory = model.encode(src, src_mask)
+    base_model = unwrap_model(model)
+    memory = base_model.encode(src, src_mask)
     batch_size = src.size(0)
 
     ys = torch.full(
@@ -90,8 +92,8 @@ def greedy_decode(
 
     for _ in range(max_len - 1):
         tgt_mask = make_tgt_mask(ys, pad_idx=pad_id)
-        out = model.decode(memory, src_mask, ys, tgt_mask)
-        logits = model.generator(out[:, -1, :])  # (B, V)
+        out = base_model.decode(memory, src_mask, ys, tgt_mask)
+        logits = base_model.generator(out[:, -1, :])  # (B, V)
         next_token = logits.argmax(dim=-1, keepdim=True)  # (B, 1)
 
         ys = torch.cat([ys, next_token], dim=1)
@@ -135,6 +137,7 @@ def validate_one_epoch(
         stats: 验证 epoch 聚合指标
     """
     model.eval()
+    base_model = unwrap_model(model)
 
     total_loss_sum = 0.0
     total_nll_sum = 0.0
@@ -159,7 +162,7 @@ def validate_one_epoch(
             batch.src_mask,
             batch.tgt_mask,
         )
-        logits = model.generator(hidden_states)
+        logits = base_model.generator(hidden_states)
 
         loss_output = criterion(logits, batch.tgt_y)
         acc_output = compute_token_accuracy(logits, batch.tgt_y, criterion.pad_idx)

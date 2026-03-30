@@ -78,6 +78,9 @@ class ParallelBPEIterableDataset(IterableDataset):
         seed: int = 42,
         num_samples: Optional[int] = None,
         sample_limit: Optional[int] = None,
+        rank: int = 0,
+        world_size: int = 1,
+        shard_across_ranks: bool = True,
     ) -> None:
         super().__init__()
         if sample_limit is not None and sample_limit <= 0:
@@ -91,6 +94,9 @@ class ParallelBPEIterableDataset(IterableDataset):
         self.epoch = 0
         self.num_samples = num_samples
         self.sample_limit = sample_limit
+        self.rank = rank
+        self.world_size = world_size
+        self.shard_across_ranks = shard_across_ranks
 
     def set_epoch(self, epoch: int) -> None:
         """
@@ -104,6 +110,8 @@ class ParallelBPEIterableDataset(IterableDataset):
     def __len__(self) -> int:
         if self.num_samples is None:
             raise TypeError("当前 IterableDataset 未提供 num_samples，无法可靠返回长度。")
+        if self.shard_across_ranks and self.world_size > 1:
+            return (self.num_samples + self.world_size - 1) // self.world_size
         return self.num_samples
 
     def _line_iterator(self) -> Iterator[Tuple[List[str], List[str]]]:
@@ -116,6 +124,13 @@ class ParallelBPEIterableDataset(IterableDataset):
         worker_info = get_worker_info()
         worker_id = 0 if worker_info is None else worker_info.id
         num_workers = 1 if worker_info is None else worker_info.num_workers
+
+        if self.shard_across_ranks:
+            total_shards = self.world_size * num_workers
+            shard_id = self.rank * num_workers + worker_id
+        else:
+            total_shards = num_workers
+            shard_id = worker_id
 
         with open(self.src_path, "r", encoding="utf-8") as f_src, \
              open(self.tgt_path, "r", encoding="utf-8") as f_tgt:
@@ -130,7 +145,7 @@ class ParallelBPEIterableDataset(IterableDataset):
                     raise RuntimeError("检测到源文件和目标文件在迭代时长度不一致。")
 
                 # 多 worker 下按行切分
-                if (line_idx % num_workers) != worker_id:
+                if (line_idx % total_shards) != shard_id:
                     continue
 
                 src_tokens = src_line.strip().split()
@@ -193,6 +208,8 @@ class ApproxTokenBucketBatchDataset(IterableDataset):
         add_src_eos: bool = True,
         max_sentences_per_batch: Optional[int] = None,
         pool_size: int = 2048,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         super().__init__()
         if src_token_budget <= 0 or tgt_token_budget <= 0:
@@ -206,6 +223,8 @@ class ApproxTokenBucketBatchDataset(IterableDataset):
         self.add_src_eos = add_src_eos
         self.max_sentences_per_batch = max_sentences_per_batch
         self.pool_size = pool_size
+        self.rank = rank
+        self.world_size = world_size
 
     def set_epoch(self, epoch: int) -> None:
         if hasattr(self.dataset, "set_epoch"):
@@ -244,6 +263,8 @@ class ApproxTokenBucketBatchDataset(IterableDataset):
         avg_sentences_per_batch = max(avg_sentences_per_batch, 1.0)
 
         estimated_num_batches = int((total_num_samples + avg_sentences_per_batch - 1) // avg_sentences_per_batch)
+        if self.world_size > 1:
+            estimated_num_batches = estimated_num_batches // self.world_size
         return max(estimated_num_batches, 1)
 
     def _sample_cost(self, sample: Tuple[List[str], List[str]]) -> Tuple[int, int]:
@@ -290,7 +311,7 @@ class ApproxTokenBucketBatchDataset(IterableDataset):
         if batch:
             yield batch
 
-    def __iter__(self) -> Iterator[List[Tuple[List[str], List[str]]]]:
+    def _iter_global_batches(self) -> Iterator[List[Tuple[List[str], List[str]]]]:
         pool: List[Tuple[List[str], List[str]]] = []
         for sample in self.dataset:
             pool.append(sample)
@@ -300,6 +321,18 @@ class ApproxTokenBucketBatchDataset(IterableDataset):
 
         if pool:
             yield from self._yield_batched_pool(pool)
+
+    def __iter__(self) -> Iterator[List[Tuple[List[str], List[str]]]]:
+        if self.world_size <= 1:
+            yield from self._iter_global_batches()
+            return
+
+        distributed_buffer: List[List[Tuple[List[str], List[str]]]] = []
+        for batch in self._iter_global_batches():
+            distributed_buffer.append(batch)
+            if len(distributed_buffer) == self.world_size:
+                yield distributed_buffer[self.rank]
+                distributed_buffer = []
 
 
 class BPEBatchCollator:
@@ -389,6 +422,8 @@ def build_bpe_dataloader(
     tgt_token_budget: Optional[int] = None,
     max_sentences_per_batch: Optional[int] = None,
     batch_pool_size: int = 2048,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
     """
     构建平行 BPE 文本 DataLoader。
@@ -411,6 +446,9 @@ def build_bpe_dataloader(
         seed=seed,
         num_samples=num_samples,
         sample_limit=sample_limit,
+        rank=rank,
+        world_size=world_size,
+        shard_across_ranks=not (world_size > 1 and src_token_budget is not None and tgt_token_budget is not None),
     )
 
     collate_fn = build_bpe_collate_fn(
@@ -436,6 +474,8 @@ def build_bpe_dataloader(
             add_src_eos=add_src_eos,
             max_sentences_per_batch=max_sentences_per_batch,
             pool_size=batch_pool_size,
+            rank=rank,
+            world_size=world_size,
         )
 
         dataloader_kwargs = dict(

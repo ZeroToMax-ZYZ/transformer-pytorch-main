@@ -27,9 +27,10 @@ from data.shared_vocab import SharedVocab
 from data.wmt_14_bpe_dataset import build_bpe_dataloader, resolve_num_samples_for_ratio
 from nets.build_transformer import make_model
 from train_utils.fit import fit
+from utils.distributed import cleanup_distributed, setup_distributed, wrap_ddp
 from utils.label_smoothing import LabelSmoothingLoss
 from utils.noam_scheduler import build_transformer_optimizer_and_scheduler
-from utils.train_env import count_trainable_parameters, get_device, get_timestamp_str, seed_everything
+from utils.train_env import count_trainable_parameters, get_timestamp_str, seed_everything
 
 
 def parse_args() -> argparse.Namespace:
@@ -237,111 +238,132 @@ def build_train_loader_kwargs(config: dict, vocab: SharedVocab) -> dict:
 
 def main() -> None:
     args = parse_args()
-    device = get_device()
-    seed_everything(seed=42, deterministic=False)
+    ctx = setup_distributed()
 
-    vocab = SharedVocab.load("data/wmt14_vocab/vocab.json")
-    vocab_size = len(vocab)
+    try:
+        seed_everything(seed=42, deterministic=False)
 
-    config = build_config(device=device, vocab_size=vocab_size)
-    config = apply_cli_overrides(config=config, args=args)
+        vocab = SharedVocab.load("data/wmt14_vocab/vocab.json")
+        vocab_size = len(vocab)
 
-    train_loader_kwargs = build_train_loader_kwargs(config=config, vocab=vocab)
-    train_loader = build_bpe_dataloader(**train_loader_kwargs)
+        config = build_config(device=ctx.device, vocab_size=vocab_size)
+        config = apply_cli_overrides(config=config, args=args)
+        config["distributed"] = {
+            "enabled": ctx.is_distributed,
+            "rank": ctx.rank,
+            "world_size": ctx.world_size,
+            "local_rank": ctx.local_rank,
+        }
 
-    valid_loader = build_bpe_dataloader(
-        src_path=config["data"]["valid_src"],
-        tgt_path=config["data"]["valid_tgt"],
-        vocab=vocab,
-        batch_size=config["valid_loader"]["batch_size"],
-        num_workers=config["valid_loader"]["num_workers"],
-        pin_memory=config["valid_loader"]["pin_memory"],
-        max_src_len=config["valid_loader"]["max_src_len"],
-        max_tgt_len=config["valid_loader"]["max_tgt_len"],
-        add_src_eos=config["valid_loader"]["add_src_eos"],
-        skip_empty=config["valid_loader"]["skip_empty"],
-        shuffle_buffer_size=config["valid_loader"]["shuffle_buffer_size"],
-        seed=config["valid_loader"]["seed"],
-        num_samples=config["data"]["valid_num_samples"],
-        persistent_workers=config["valid_loader"]["persistent_workers"],
-        prefetch_factor=config["valid_loader"]["prefetch_factor"],
-        src_token_budget=config["valid_loader"].get("src_token_budget"),
-        tgt_token_budget=config["valid_loader"].get("tgt_token_budget"),
-        max_sentences_per_batch=config["valid_loader"].get("max_sentences_per_batch"),
-        batch_pool_size=config["valid_loader"].get("batch_pool_size", 2048),
-    )
+        train_loader_kwargs = build_train_loader_kwargs(config=config, vocab=vocab)
+        train_loader_kwargs["rank"] = ctx.rank
+        train_loader_kwargs["world_size"] = ctx.world_size
+        train_loader = build_bpe_dataloader(**train_loader_kwargs)
 
-    model = make_model(
-        src_vocab=vocab_size,
-        tgt_vocab=vocab_size,
-        N=config["model"]["N"],
-        d_model=config["model"]["d_model"],
-        d_ff=config["model"]["d_ff"],
-        h=config["model"]["h"],
-        dropout=config["model"]["dropout"],
-        share_embeddings=config["model"]["share_embeddings"],
-    )
+        valid_loader = None
+        if ctx.is_main_process:
+            valid_loader = build_bpe_dataloader(
+                src_path=config["data"]["valid_src"],
+                tgt_path=config["data"]["valid_tgt"],
+                vocab=vocab,
+                batch_size=config["valid_loader"]["batch_size"],
+                num_workers=config["valid_loader"]["num_workers"],
+                pin_memory=config["valid_loader"]["pin_memory"],
+                max_src_len=config["valid_loader"]["max_src_len"],
+                max_tgt_len=config["valid_loader"]["max_tgt_len"],
+                add_src_eos=config["valid_loader"]["add_src_eos"],
+                skip_empty=config["valid_loader"]["skip_empty"],
+                shuffle_buffer_size=config["valid_loader"]["shuffle_buffer_size"],
+                seed=config["valid_loader"]["seed"],
+                num_samples=config["data"]["valid_num_samples"],
+                persistent_workers=config["valid_loader"]["persistent_workers"],
+                prefetch_factor=config["valid_loader"]["prefetch_factor"],
+                src_token_budget=config["valid_loader"].get("src_token_budget"),
+                tgt_token_budget=config["valid_loader"].get("tgt_token_budget"),
+                max_sentences_per_batch=config["valid_loader"].get("max_sentences_per_batch"),
+                batch_pool_size=config["valid_loader"].get("batch_pool_size", 2048),
+                rank=0,
+                world_size=1,
+            )
 
-    param_count = count_trainable_parameters(model)
-    print(f"模型可训练参数量: {param_count / 1e6:.2f} M")
-    print(
-        "训练集样本数: "
-        f"{train_loader_kwargs['num_samples']} / {config['data']['train_num_samples']} "
-        f"(ratio={config['data']['train_subset_ratio']:.4f})"
-    )
-
-    criterion = LabelSmoothingLoss(
-        vocab_size=vocab_size,
-        pad_idx=vocab.pad_id,
-        smoothing=config["criterion"]["smoothing"],
-    )
-
-    optimizer, scheduler = build_transformer_optimizer_and_scheduler(
-        model=model,
-        d_model=config["model"]["d_model"],
-        warmup_steps=config["scheduler"]["warmup_steps"],
-        factor=config["scheduler"]["factor"],
-        beta1=config["optimizer"]["beta1"],
-        beta2=config["optimizer"]["beta2"],
-        eps=config["optimizer"]["eps"],
-        weight_decay=config["optimizer"]["weight_decay"],
-    )
-
-    use_amp = config["use_amp"]
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-
-    exp_dir = args.output_dir
-    if exp_dir is None:
-        exp_dir = os.path.join(
-            "experiments",
-            "{0}_{1}".format(config["exp_name"], get_timestamp_str()),
+        model = make_model(
+            src_vocab=vocab_size,
+            tgt_vocab=vocab_size,
+            N=config["model"]["N"],
+            d_model=config["model"]["d_model"],
+            d_ff=config["model"]["d_ff"],
+            h=config["model"]["h"],
+            dropout=config["model"]["dropout"],
+            share_embeddings=config["model"]["share_embeddings"],
         )
 
-    fit(
-        model=model,
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        num_epochs=config["fit"]["num_epochs"],
-        output_dir=exp_dir,
-        config=config,
-        vocab=vocab,
-        scaler=scaler,
-        use_amp=use_amp,
-        grad_clip_norm=config["fit"]["grad_clip_norm"],
-        train_log_interval=config["fit"]["train_log_interval"],
-        histogram_interval=config["fit"]["histogram_interval"],
-        save_every_epochs=config["fit"]["save_every_epochs"],
-        valid_num_text_samples=config["fit"]["valid_num_text_samples"],
-        max_train_steps_per_epoch=config["fit"]["max_train_steps_per_epoch"],
-        max_valid_steps_per_epoch=config["fit"]["max_valid_steps_per_epoch"],
-        start_epoch=1,
-        global_step_init=0,
-        best_metric_init=None,
-    )
+        param_count = count_trainable_parameters(model)
+        if ctx.is_main_process:
+            print(f"模型可训练参数量: {param_count / 1e6:.2f} M")
+            print(
+                "训练集样本数: "
+                f"{train_loader_kwargs['num_samples']} / {config['data']['train_num_samples']} "
+                f"(ratio={config['data']['train_subset_ratio']:.4f})"
+            )
+
+        model = model.to(ctx.device)
+        model = wrap_ddp(model, ctx)
+
+        criterion = LabelSmoothingLoss(
+            vocab_size=vocab_size,
+            pad_idx=vocab.pad_id,
+            smoothing=config["criterion"]["smoothing"],
+        )
+
+        optimizer, scheduler = build_transformer_optimizer_and_scheduler(
+            model=model,
+            d_model=config["model"]["d_model"],
+            warmup_steps=config["scheduler"]["warmup_steps"],
+            factor=config["scheduler"]["factor"],
+            beta1=config["optimizer"]["beta1"],
+            beta2=config["optimizer"]["beta2"],
+            eps=config["optimizer"]["eps"],
+            weight_decay=config["optimizer"]["weight_decay"],
+        )
+
+        use_amp = config["use_amp"]
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+        exp_dir = args.output_dir
+        if exp_dir is None:
+            exp_dir = os.path.join(
+                "experiments",
+                "{0}_{1}".format(config["exp_name"], get_timestamp_str()),
+            )
+
+        fit(
+            model=model,
+            train_loader=train_loader,
+            valid_loader=valid_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=ctx.device,
+            num_epochs=config["fit"]["num_epochs"],
+            output_dir=exp_dir,
+            config=config,
+            vocab=vocab,
+            scaler=scaler,
+            use_amp=use_amp,
+            grad_clip_norm=config["fit"]["grad_clip_norm"],
+            train_log_interval=config["fit"]["train_log_interval"],
+            histogram_interval=config["fit"]["histogram_interval"],
+            save_every_epochs=config["fit"]["save_every_epochs"],
+            valid_num_text_samples=config["fit"]["valid_num_text_samples"],
+            max_train_steps_per_epoch=config["fit"]["max_train_steps_per_epoch"],
+            max_valid_steps_per_epoch=config["fit"]["max_valid_steps_per_epoch"],
+            start_epoch=1,
+            global_step_init=0,
+            best_metric_init=None,
+            is_main_process=ctx.is_main_process,
+        )
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":

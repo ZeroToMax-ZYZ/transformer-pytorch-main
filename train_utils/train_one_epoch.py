@@ -15,9 +15,11 @@ import time
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from torch.nn.utils import clip_grad_norm_
 from tqdm.auto import tqdm
 
+from utils.distributed import all_reduce_sum, is_distributed_initialized, unwrap_model
 from utils.label_smoothing import (
     LabelSmoothingLoss,
     compute_perplexity_from_loss,
@@ -69,6 +71,7 @@ def train_one_epoch(
     log_interval: int = 100,
     histogram_interval: int = 1000,
     max_steps_per_epoch: Optional[int] = None,
+    is_main_process: bool = True,
 ) -> Tuple[Dict[str, float], int]:
     """
     训练一个 epoch。
@@ -114,10 +117,12 @@ def train_one_epoch(
     window_total_tokens = 0
 
     optimizer.zero_grad(set_to_none=True)
-    progress_total = _resolve_progress_total(
-        train_loader=train_loader,
-        max_steps_per_epoch=max_steps_per_epoch,
-    )
+    progress_total = None
+    if is_main_process:
+        progress_total = _resolve_progress_total(
+            train_loader=train_loader,
+            max_steps_per_epoch=max_steps_per_epoch,
+        )
 
     progress_bar = tqdm(
         total=progress_total,
@@ -125,6 +130,7 @@ def train_one_epoch(
         dynamic_ncols=False,
         ncols=120,
         leave=True,
+        disable=not is_main_process,
     )
 
     for batch in train_loader:
@@ -133,6 +139,7 @@ def train_one_epoch(
 
         step_start_time = time.time()
         batch = batch.to(device)
+        base_model = unwrap_model(model)
 
         with torch.cuda.amp.autocast(enabled=(use_amp and device.type == "cuda")):
             hidden_states = model(
@@ -141,7 +148,7 @@ def train_one_epoch(
                 batch.src_mask,
                 batch.tgt_mask,
             )
-            logits = model.generator(hidden_states)
+            logits = base_model.generator(hidden_states)
 
             loss_output = criterion(logits, batch.tgt_y)
             acc_output = compute_token_accuracy(logits, batch.tgt_y, criterion.pad_idx)
@@ -175,7 +182,8 @@ def train_one_epoch(
 
         global_step += 1
         total_steps += 1
-        progress_bar.update(1)
+        if is_main_process:
+            progress_bar.update(1)
 
         iter_time = max(time.time() - step_start_time, 1e-8)
         tokens_per_sec = batch_tokens / iter_time
@@ -194,11 +202,12 @@ def train_one_epoch(
         window_correct_tokens += batch_correct_tokens
         window_total_tokens += batch_total_tokens
 
-        progress_bar.set_postfix(
-            lr=f"{float(current_lr):.2e}",
-            loss=f"{batch_loss:.4f}",
-            tok_s=f"{tokens_per_sec:.0f}",
-        )
+        if is_main_process:
+            progress_bar.set_postfix(
+                lr=f"{float(current_lr):.2e}",
+                loss=f"{batch_loss:.4f}",
+                tok_s=f"{tokens_per_sec:.0f}",
+            )
 
         # -------------------------
         # step 级 TensorBoard 记录
@@ -239,7 +248,7 @@ def train_one_epoch(
             with torch.no_grad():
                 prediction_confidence = torch.softmax(logits.detach(), dim=-1).amax(dim=-1)
             tb_logger.log_representative_histograms(
-                model=model,
+                model=base_model,
                 global_step=global_step,
                 prediction_confidence=prediction_confidence,
             )
@@ -252,15 +261,44 @@ def train_one_epoch(
     if total_tokens == 0:
         raise ValueError("当前 epoch 没有有效 token，无法汇总训练指标。")
 
+    epoch_time_sec = time.time() - epoch_start_time
+
+    if is_distributed_initialized():
+        reduced = torch.tensor(
+            [
+                total_loss_sum,
+                total_nll_sum,
+                total_smooth_sum,
+                float(total_correct_tokens),
+                float(total_tokens),
+                total_grad_norm,
+                total_tokens_per_sec,
+                float(total_steps),
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
+        all_reduce_sum(reduced)
+        total_loss_sum = float(reduced[0].item())
+        total_nll_sum = float(reduced[1].item())
+        total_smooth_sum = float(reduced[2].item())
+        total_correct_tokens = int(reduced[3].item())
+        total_tokens = int(reduced[4].item())
+        total_grad_norm = float(reduced[5].item())
+        total_tokens_per_sec = float(reduced[6].item())
+        total_steps = int(reduced[7].item())
+
+        epoch_time_tensor = torch.tensor(epoch_time_sec, dtype=torch.float64, device=device)
+        dist.all_reduce(epoch_time_tensor, op=dist.ReduceOp.MAX)
+        epoch_time_sec = float(epoch_time_tensor.item())
+
     avg_loss = total_loss_sum / total_tokens
     avg_nll_loss = total_nll_sum / total_tokens
     avg_smooth_loss = total_smooth_sum / total_tokens
     avg_token_acc = total_correct_tokens / total_tokens
     avg_ppl = compute_perplexity_from_loss(avg_nll_loss)
     avg_grad_norm = total_grad_norm / max(total_steps, 1)
-    avg_tokens_per_sec = total_tokens_per_sec / max(total_steps, 1)
-
-    epoch_time_sec = time.time() - epoch_start_time
+    avg_tokens_per_sec = total_tokens / max(epoch_time_sec, 1e-8)
 
     stats = {
         "epoch": float(epoch),
