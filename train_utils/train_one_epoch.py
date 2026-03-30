@@ -25,6 +25,34 @@ from utils.label_smoothing import (
 )
 
 
+def _resolve_progress_total(train_loader, max_steps_per_epoch: Optional[int]) -> Optional[int]:
+    """
+    为 tqdm 决定一个总步数。
+
+    优先级：
+    1. 显式的 max_steps_per_epoch
+    2. len(train_loader)
+    3. token-budget batching 下的粗略估算
+    """
+    if max_steps_per_epoch is not None:
+        return max_steps_per_epoch
+
+    try:
+        return len(train_loader)
+    except TypeError:
+        pass
+
+    dataset = getattr(train_loader, "dataset", None)
+    estimate_fn = getattr(dataset, "estimate_num_batches", None)
+    if callable(estimate_fn):
+        try:
+            return int(estimate_fn())
+        except TypeError:
+            return None
+
+    return None
+
+
 def train_one_epoch(
     model: torch.nn.Module,
     train_loader,
@@ -86,17 +114,16 @@ def train_one_epoch(
     window_total_tokens = 0
 
     optimizer.zero_grad(set_to_none=True)
-    progress_total = max_steps_per_epoch
-    if progress_total is None:
-        try:
-            progress_total = len(train_loader)
-        except TypeError:
-            progress_total = None
+    progress_total = _resolve_progress_total(
+        train_loader=train_loader,
+        max_steps_per_epoch=max_steps_per_epoch,
+    )
 
     progress_bar = tqdm(
         total=progress_total,
         desc=f"Epoch {epoch} Train",
-        dynamic_ncols=True,
+        dynamic_ncols=False,
+        ncols=120,
         leave=True,
     )
 

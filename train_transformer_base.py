@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-subset-ratio",
         type=float,
-        default=0.001,
+        default=None,
         help="Use only a prefix subset of the training split, e.g. 0.2 means 20%% of train samples.",
     )
     parser.add_argument("--train-num-workers", type=int, default=None, help="Override train DataLoader workers.")
@@ -61,7 +61,7 @@ def build_config(device: torch.device, vocab_size: int) -> dict:
     构建实验配置。
     """
     use_amp = device.type == "cuda"
-    default_train_num_workers = 0 if os.name == "nt" else 2
+    default_train_num_workers = 2 if os.name == "nt" else 2
 
     config = {
         "exp_name": "transformer_wmt14_en_de_base",
@@ -128,8 +128,8 @@ def build_config(device: torch.device, vocab_size: int) -> dict:
             "seed": 42,
             "persistent_workers": True,
             "prefetch_factor": 2,
-            "src_token_budget": 1024,
-            "tgt_token_budget": 1024,
+            "src_token_budget": 2048, # 显卡预算
+            "tgt_token_budget": 2048,
             "max_sentences_per_batch": None,
             "batch_pool_size": 2048,
         },
@@ -155,7 +155,7 @@ def build_config(device: torch.device, vocab_size: int) -> dict:
             "histogram_interval": 0,
             "save_every_epochs": 1,
             "valid_num_text_samples": 0,
-            "max_train_steps_per_epoch": 1000,
+            "max_train_steps_per_epoch": None,
             "max_valid_steps_per_epoch": None,
         },
     }

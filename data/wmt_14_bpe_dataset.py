@@ -211,6 +211,41 @@ class ApproxTokenBucketBatchDataset(IterableDataset):
         if hasattr(self.dataset, "set_epoch"):
             self.dataset.set_epoch(epoch)
 
+    def estimate_num_batches(self, sample_size: int = 2048) -> int:
+        """
+        基于前若干样本的句长分布，粗略估算一个 epoch 的 batch 数。
+
+        说明：
+        1. 这里只用于 tqdm 进度条的 ETA 展示，不参与真实训练逻辑。
+        2. 估算方法是：
+           - 取前 sample_size 个样本
+           - 按当前 token budget 规则在内存中模拟分 batch
+           - 计算平均每个 batch 包含多少句子
+           - 再用总样本数反推出总 batch 数
+        """
+        total_num_samples = getattr(self.dataset, "num_samples", None)
+        if total_num_samples is None or total_num_samples <= 0:
+            raise TypeError("Underlying dataset does not expose a valid num_samples for estimation.")
+
+        preview_samples: List[Tuple[List[str], List[str]]] = []
+        for idx, sample in enumerate(iter(self.dataset)):
+            if idx >= sample_size:
+                break
+            preview_samples.append(sample)
+
+        if not preview_samples:
+            raise TypeError("Unable to estimate batch count because preview sampling returned no data.")
+
+        simulated_batches = list(self._yield_batched_pool(preview_samples.copy()))
+        if not simulated_batches:
+            raise TypeError("Unable to estimate batch count because preview batching returned no batches.")
+
+        avg_sentences_per_batch = sum(len(batch) for batch in simulated_batches) / len(simulated_batches)
+        avg_sentences_per_batch = max(avg_sentences_per_batch, 1.0)
+
+        estimated_num_batches = int((total_num_samples + avg_sentences_per_batch - 1) // avg_sentences_per_batch)
+        return max(estimated_num_batches, 1)
+
     def _sample_cost(self, sample: Tuple[List[str], List[str]]) -> Tuple[int, int]:
         src_tokens, tgt_tokens = sample
         src_len = len(src_tokens) + (1 if self.add_src_eos else 0)

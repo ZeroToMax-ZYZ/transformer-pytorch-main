@@ -15,11 +15,9 @@ def attention(query, key, value, mask=None, dropout=None):
     - value: (B, H, T_k, d_v)
     - mask:  可广播到 (B, H, T_q, T_k)
     """
-
     # 提取特征维度 d_k
     # size(-1) 取最后一个维度的长度，这是进行缩放的数学基准。
     d_k = query.size(-1) 
-    
     # 步骤 1 & 2：计算点积并立刻缩放 (MatMul & Scale)
     # key.transpose(-2, -1) 将 key 的最后两个维度互换，变为 (..., d_k, seq_len_k)
     # torch.matmul 执行批量矩阵乘法，(..., seq_len_q, d_k) @ (..., d_k, seq_len_k)
@@ -58,9 +56,8 @@ class MultiHeadedAttention(nn.Module):
     3. 调用底层 `attention` 完成注意力计算。
     4. 重新拼接各头并映射回 `d_model`。
     """
-
     def __init__(self, h, d_model, dropout=0.1):
-        super(MultiHeadedAttention, self).__init__()
+        super().__init__()
         # 边界条件检查：特征维度必须能被头数整除，否则无法均匀切分张量
         assert d_model % h == 0
         
