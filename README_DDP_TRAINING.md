@@ -33,19 +33,19 @@ python train_transformer_base.py --num-epochs 20 --train-src-token-budget 2048 -
 推荐用 `torchrun`：
 
 ```bash
-torchrun --standalone --nproc_per_node=4 train_transformer_base.py
+torchrun --standalone --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29500 train_transformer_base.py
 ```
 
 如果你的 3080 显存比较紧，先从更保守的每卡 token budget 开始：
 
 ```bash
-torchrun --standalone --nproc_per_node=4 train_transformer_base.py --train-src-token-budget 1536 --train-tgt-token-budget 1536
+torchrun --standalone --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29500 train_transformer_base.py --train-src-token-budget 1536 --train-tgt-token-budget 1536
 ```
 
 如果显存充足，再尝试默认的：
 
 ```bash
-torchrun --standalone --nproc_per_node=4 train_transformer_base.py --train-src-token-budget 2048 --train-tgt-token-budget 2048
+torchrun --standalone --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29500 train_transformer_base.py --train-src-token-budget 2048 --train-tgt-token-budget 2048
 ```
 
 ## 3. 常用启动参数
@@ -68,7 +68,7 @@ torchrun --standalone --nproc_per_node=4 train_transformer_base.py --train-src-t
 示例：
 
 ```bash
-torchrun --standalone --nproc_per_node=4 train_transformer_base.py \
+torchrun --standalone --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29500 train_transformer_base.py \
   --num-epochs 30 \
   --train-src-token-budget 1536 \
   --train-tgt-token-budget 1536 \
@@ -97,13 +97,13 @@ experiments/transformer_wmt14_en_de_base_时间戳/
 建议先用这个命令起跑：
 
 ```bash
-torchrun --standalone --nproc_per_node=4 train_transformer_base.py --train-src-token-budget 1536 --train-tgt-token-budget 1536 --train-num-workers 2
+torchrun --standalone --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29500 train_transformer_base.py --train-src-token-budget 1536 --train-tgt-token-budget 1536 --train-num-workers 2
 ```
 
 如果稳定且没有 OOM，再提高到：
 
 ```bash
-torchrun --standalone --nproc_per_node=4 train_transformer_base.py --train-src-token-budget 2048 --train-tgt-token-budget 2048 --train-num-workers 2
+torchrun --standalone --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29500 train_transformer_base.py --train-src-token-budget 2048 --train-tgt-token-budget 2048 --train-num-workers 2
 ```
 
 ## 6. 注意事项

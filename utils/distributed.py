@@ -26,12 +26,24 @@ def is_distributed_initialized() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 
+def _prefer_ipv4_localhost_for_single_node(world_size: int) -> None:
+    """
+    单机多卡时优先使用 IPv4 localhost，避免容器 hostname 的 IPv6 解析告警。
+    """
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
+    if world_size > 1 and local_world_size == world_size:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ.setdefault("MASTER_PORT", "29500")
+
+
 def setup_distributed() -> DistributedContext:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
     if world_size > 1:
+        _prefer_ipv4_localhost_for_single_node(world_size)
+
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
             device = torch.device("cuda", local_rank)
