@@ -1,0 +1,11 @@
+{
+  "vocab_size": 9712,
+  "pad_token": "<pad>",
+  "bos_token": "<bos>",
+  "eos_token": "<eos>",
+  "unk_token": "<unk>",
+  "pad_id": 0,
+  "bos_id": 1,
+  "eos_id": 2,
+  "unk_id": 3
+}

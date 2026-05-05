@@ -1,0 +1,14 @@
+{
+  "dataset": "multi30k",
+  "language_pair": "en-de",
+  "source": "official_multi30k_task1_tokenized",
+  "raw_dir": "data/multi30k_tok_en_de",
+  "bpe_dir": "data/multi30k_bpe_en_de",
+  "vocab_dir": "data/multi30k_vocab",
+  "num_bpe_merges": 10000,
+  "bpe_min_frequency": 2,
+  "train_num_samples": 29000,
+  "valid_num_samples": 1014,
+  "test_num_samples": 1000,
+  "vocab_size": 9712
+}
